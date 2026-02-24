@@ -1,11 +1,17 @@
 import express from "express";
 import http from "http";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+import auth from "basic-auth";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
 
@@ -14,78 +20,39 @@ let camera = null;
 let cameraVersion = null;
 let streaming = false;
 
-// Aktuelle Auflösung
+// Alle Viewer
+const viewers = new Set();
+
+// Auflösung
 let currentResolution = "VGA";
 
-// Beispiel OTA Firmware (GitHub)
+// OTA Firmware Beispiel
 let latestFirmware = {
   version: "1.0.0",
   url: "https://raw.githubusercontent.com/USER/REPO/main/firmware.bin"
 };
 
-// HTML Webinterface
-app.get("/", (req, res) => {
-  res.send(`
-<html>
-  <body>
-    <h2>ESP32 Cloud Camera</h2>
-    <img id="stream" width="640"/><br>
+// --- HTTP Basic Auth ---
+const USERNAME = "admin";
+const PASSWORD = "geheim";
 
-    <select id="res">
-      <option>QVGA</option>
-      <option selected>VGA</option>
-      <option>SVGA</option>
-      <option>XGA</option>
-    </select>
-    <button id="start">Start Stream</button>
-    <button id="stop">Stop Stream</button>
+function authMiddleware(req, res, next) {
+  const user = auth(req);
+  if (!user || user.name !== USERNAME || user.pass !== PASSWORD) {
+    res.set("WWW-Authenticate", 'Basic realm="ESP32-CAM"');
+    return res.status(401).send("Authentication required.");
+  }
+  next();
+}
 
-    <script>
-      const ws = new WebSocket("wss://" + location.host + "/viewer");
-      const img = document.getElementById("stream");
+// --- Webinterface ---
+app.use(authMiddleware);
+app.use(express.static(path.join(__dirname, "public")));
 
-      ws.binaryType = "arraybuffer";
+app.get("/health", (req, res) => res.send("OK"));
+app.get("/firmware", (req, res) => res.json(latestFirmware));
 
-      ws.onopen = () => console.log("Connected to server");
-
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") return;
-
-        const blob = new Blob([event.data], { type: "image/jpeg" });
-        img.src = URL.createObjectURL(blob);
-      };
-
-      document.getElementById("res").onchange = (e) => {
-        ws.send(JSON.stringify({
-          type: "set_resolution",
-          value: e.target.value
-        }));
-      };
-
-      document.getElementById("start").onclick = () => {
-        ws.send(JSON.stringify({ type: "start_stream" }));
-      };
-
-      document.getElementById("stop").onclick = () => {
-        ws.send(JSON.stringify({ type: "stop_stream" }));
-      };
-    </script>
-  </body>
-</html>
-  `);
-});
-
-// Health-Check Endpoint
-app.get("/health", (req, res) => {
-  res.send("OK");
-});
-
-// Firmware Info Endpoint
-app.get("/firmware", (req, res) => {
-  res.json(latestFirmware);
-});
-
-// WebSocket Handling
+// --- WebSocket Handling ---
 wss.on("connection", (ws, req) => {
   const path = req.url;
 
@@ -97,23 +64,19 @@ wss.on("connection", (ws, req) => {
       if (typeof msg === "string") {
         try {
           const data = JSON.parse(msg);
-
           if (data.type === "camera_register") {
             cameraVersion = data.version;
-            console.log("Camera firmware version:", cameraVersion);
+            console.log("Camera firmware:", cameraVersion);
           }
-
           if (data.type === "health") {
-            // optional: keep alive log
+            // optional
           }
-
           if (data.type === "update_result") {
-            console.log("OTA update result:", data.status);
+            console.log("OTA result:", data.status);
           }
-
-        } catch (e) {}
+        } catch {}
       } else {
-        // Binary MJPEG Frame -> an alle Viewer senden
+        // Binary MJPEG -> an alle Viewer senden
         viewers.forEach(v => {
           if (v.readyState === WebSocket.OPEN) v.send(msg);
         });
@@ -134,24 +97,22 @@ wss.on("connection", (ws, req) => {
     ws.on("message", (msg) => {
       try {
         const data = JSON.parse(msg);
+        if (!camera || camera.readyState !== WebSocket.OPEN) return;
 
-        if (!camera) return;
-
-        if (data.type === "start_stream") {
-          camera.send(JSON.stringify({ type: "start_stream" }));
-          streaming = true;
+        switch (data.type) {
+          case "start_stream":
+            camera.send(JSON.stringify({ type: "start_stream" }));
+            streaming = true;
+            break;
+          case "stop_stream":
+            camera.send(JSON.stringify({ type: "stop_stream" }));
+            streaming = false;
+            break;
+          case "set_resolution":
+            currentResolution = data.value;
+            camera.send(JSON.stringify({ type: "set_resolution", value: data.value }));
+            break;
         }
-
-        if (data.type === "stop_stream") {
-          camera.send(JSON.stringify({ type: "stop_stream" }));
-          streaming = false;
-        }
-
-        if (data.type === "set_resolution") {
-          currentResolution = data.value;
-          camera.send(JSON.stringify({ type: "set_resolution", value: data.value }));
-        }
-
       } catch {}
     });
 
@@ -162,10 +123,7 @@ wss.on("connection", (ws, req) => {
   }
 });
 
-// Alle Viewer speichern
-const viewers = new Set();
-
-// Firmware Check alle 10 Minuten
+// --- Firmware Check alle 10 Minuten ---
 async function checkFirmware() {
   try {
     const res = await fetch(
@@ -175,7 +133,7 @@ async function checkFirmware() {
 
     if (data.version !== latestFirmware.version) {
       latestFirmware = data;
-      console.log("New firmware available:", data.version);
+      console.log("New firmware:", data.version);
 
       if (camera && camera.readyState === WebSocket.OPEN) {
         camera.send(JSON.stringify({
@@ -185,14 +143,12 @@ async function checkFirmware() {
         }));
       }
     }
-  } catch (e) {
+  } catch {
     console.log("Firmware check failed");
   }
 }
 
-setInterval(checkFirmware, 10 * 60 * 1000); // alle 10 Minuten
+setInterval(checkFirmware, 10 * 60 * 1000);
 
-// Server starten
-server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+// --- Server starten ---
+server.listen(PORT, () => console.log("Server running on port", PORT));

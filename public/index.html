@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>ESP32 Cloud Camera</title>
+  </head>
+  <body>
+    <h2>ESP32 Cloud Camera</h2>
+    <img id="stream" width="640" /><br>
+
+    <select id="res">
+      <option>QVGA</option>
+      <option selected>VGA</option>
+      <option>SVGA</option>
+      <option>XGA</option>
+    </select>
+
+    <button id="start">Start Stream</button>
+    <button id="stop">Stop Stream</button>
+
+    <script>
+      const ws = new WebSocket(
+        (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/viewer"
+      );
+      const img = document.getElementById("stream");
+
+      ws.binaryType = "arraybuffer";
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === "string") return;
+        const blob = new Blob([event.data], { type: "image/jpeg" });
+        img.src = URL.createObjectURL(blob);
+      };
+
+      document.getElementById("res").onchange = (e) => {
+        ws.send(JSON.stringify({ type: "set_resolution", value: e.target.value }));
+      };
+
+      document.getElementById("start").onclick = () => {
+        ws.send(JSON.stringify({ type: "start_stream" }));
+      };
+
+      document.getElementById("stop").onclick = () => {
+        ws.send(JSON.stringify({ type: "stop_stream" }));
+      };
+    </script>
+  </body>
+</html>
